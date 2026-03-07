@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Khan/genqlient/graphql"
 	"github.com/looplj/axonhub/axon/agent"
@@ -20,6 +21,8 @@ import (
 	"github.com/looplj/axonhub/axon/permission/grant"
 	"github.com/looplj/axonhub/axon/permission/policy"
 	"github.com/looplj/axonhub/axon/provider/anthropic"
+	"github.com/looplj/axonhub/axon/summarizer"
+	"github.com/looplj/axonhub/axon/task"
 	"github.com/looplj/axonhub/axon/thread"
 	"github.com/looplj/axonhub/cmd/axonclaw/bootstrap"
 	"github.com/looplj/axonhub/cmd/axonclaw/build"
@@ -131,6 +134,11 @@ Git Commit: %s`, build.GetVersion(), build.GetBuildTime(), build.GetGitCommit())
 		Stdout:    os.Stdout,
 		Stderr:    os.Stderr,
 	}))
+	rootCmd.AddCommand(cmds.NewTaskCommand(cmds.TaskOptions{
+		Dir:    configDir,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}))
 
 	return rootCmd
 }
@@ -191,10 +199,35 @@ func runAgent(cfg conf.Config, wd string, debug bool) error {
 	}
 	threadMgr := thread.NewManager(threadStore)
 
-	eventBus := bus.New(
-		bus.WithRecover(logger),
-		bus.WithTracing(),
+	var contextMgr agent.ContextManager
+	contextCfg := agent.DefaultContextManagerConfig()
+	contextCfg.Enabled = true
+	contextCfg.Logger = logger
+	if cfg.ContextRecentMessages > 0 {
+		contextCfg.MaxRecentMessages = cfg.ContextRecentMessages
+	}
+	if cfg.ContextSoftTokenLimit > 0 {
+		contextCfg.SoftTokenLimit = cfg.ContextSoftTokenLimit
+	}
+
+	contextCfg.Summarizer = summarizer.NewProvider(summarizer.ProviderOptions{
+		Provider: provider,
+		Model:    boot.Model,
+	})
+
+	contextStore := agent.NewContextManagerFileStore(filepath.Join(axonclawDir, "messages"))
+	cm, err := agent.NewSmartContextManager(contextCfg, contextStore)
+	if err != nil {
+		return fmt.Errorf("initialize context manager: %w", err)
+	}
+	contextMgr = cm
+
+	logger.Info("context manager enabled",
+		"max_recent_messages", contextCfg.MaxRecentMessages,
+		"soft_token_limit", contextCfg.SoftTokenLimit,
 	)
+
+	eventBus := bus.New(bus.WithRecover(logger), bus.WithTracing())
 	defer eventBus.Close()
 
 	eventBus.Subscribe(agent.TopicAgentEvent, bus.TypedHandler(func(_ context.Context, _ bus.Event, ev agent.AgentEvent) error {
@@ -215,7 +248,7 @@ func runAgent(cfg conf.Config, wd string, debug bool) error {
 		return nil
 	}))
 
-	grantsStore := grant.NewMemoryStore(grant.NewFileStore(filepath.Join(wd, ".axonclaw", "permission")))
+	grantsStore := grant.NewMemoryStore(grant.NewFileStore(filepath.Join(axonclawDir, "permission")))
 	if err := grantsStore.LoadGlobal(); err != nil {
 		return fmt.Errorf("load global grants: %w", err)
 	}
@@ -241,16 +274,32 @@ func runAgent(cfg conf.Config, wd string, debug bool) error {
 	})
 
 	r := runner.New(runner.NewOptions{
-		Logger:        logger,
-		Client:        gqlClient,
-		Provider:      provider,
-		Config:        cfg,
-		Workspace:     wd,
-		Boot:          boot,
-		ThreadMgr:     threadMgr,
-		PermEvaluator: permEvaluator,
-		Bus:           eventBus,
+		Logger:         logger,
+		Client:         gqlClient,
+		Provider:       provider,
+		ContextManager: contextMgr,
+		Config:         cfg,
+		Workspace:      wd,
+		Boot:           boot,
+		ThreadMgr:      threadMgr,
+		PermEvaluator:  permEvaluator,
+		Bus:            eventBus,
 	})
+
+	taskStore, err := task.NewStore(filepath.Join(axonclawDir, "tasks"))
+	if err != nil {
+		return fmt.Errorf("init task store: %w", err)
+	}
+	taskHandler := runner.NewAxonClawTaskHandler(logger, wd, r)
+	taskScheduler, err := task.NewScheduler(logger, taskStore, taskHandler, task.SchedulerOptions{
+		TickInterval: time.Minute,
+	})
+	if err != nil {
+		return fmt.Errorf("init task scheduler: %w", err)
+	}
+	taskScheduler.Start(ctx)
+	defer taskScheduler.Stop()
+
 	if err := r.Run(ctx); err != nil {
 		if err != context.Canceled {
 			logger.Error("runner stopped with error", "error", err)

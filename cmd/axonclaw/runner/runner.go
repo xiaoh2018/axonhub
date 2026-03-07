@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Khan/genqlient/graphql"
@@ -10,9 +12,12 @@ import (
 	"github.com/looplj/axonhub/axon/agent"
 	"github.com/looplj/axonhub/axon/api"
 	"github.com/looplj/axonhub/axon/bus"
-	axoncontext "github.com/looplj/axonhub/axon/context"
 	"github.com/looplj/axonhub/axon/permission"
+	"github.com/looplj/axonhub/axon/task"
 	"github.com/looplj/axonhub/axon/thread"
+
+	axoncontext "github.com/looplj/axonhub/axon/context"
+
 	"github.com/looplj/axonhub/cmd/axonclaw/bootstrap"
 	"github.com/looplj/axonhub/cmd/axonclaw/conf"
 )
@@ -20,72 +25,92 @@ import (
 const defaultMaxIterations = 30
 
 type Runner struct {
-	Client       graphql.Client
-	Agent        *agent.Agent
-	Logger       *slog.Logger
-	Workspace    string
-	Config       conf.Config
-	ThreadID     string
-	ThreadMgr    *thread.Manager
-	Boot         *bootstrap.Result
-	lastSequence int
+	Client        graphql.Client
+	Agent         *agent.Agent
+	Logger        *slog.Logger
+	Workspace     string
+	Config        conf.Config
+	ThreadID      string
+	ThreadMgr     *thread.Manager
+	Boot          *bootstrap.Result
+	lastSequence  int
+	TaskScheduler *task.Scheduler
+	processMu     sync.Mutex
+	processing    atomic.Bool
 }
 
 type NewOptions struct {
-	Logger        *slog.Logger
-	Client        graphql.Client
-	Provider      agent.Provider
-	Config        conf.Config
-	Workspace     string
-	Boot          *bootstrap.Result
-	ThreadMgr     *thread.Manager
-	PermEvaluator *permission.Evaluator
-	Bus           bus.EventBus
+	Logger         *slog.Logger
+	Client         graphql.Client
+	Provider       agent.Provider
+	ContextManager agent.ContextManager
+	Config         conf.Config
+	Workspace      string
+	Boot           *bootstrap.Result
+	ThreadMgr      *thread.Manager
+	PermEvaluator  *permission.Evaluator
+	Bus            bus.EventBus
+	TaskScheduler  *task.Scheduler
 }
 
 func New(opts NewOptions) *Runner {
 	permMw := NewPermissionMiddleware(opts.PermEvaluator)
 
-	localPrompt := buildLocalSystemPrompt(PromptEnv{
-		Date:         opts.Boot.Date,
-		Timezone:     opts.Boot.Timezone,
-		OS:           opts.Boot.OS,
-		Workspace:    opts.Workspace,
-		ThreadID:     opts.Boot.ThreadID,
-		AxonClawPath: opts.Boot.AxonClawPath,
-		SkillsRoot:   opts.Boot.SkillsRoot,
-		ConfigDir:    opts.Boot.ConfigDir,
-	})
+	env := buildPromptEnv(opts.Boot, opts.Workspace)
+	serverPrompt := buildServerSystemPrompt(opts.Boot.SystemPrompt, env)
+	serverPrompt = appendSkillsToPrompt(serverPrompt, opts.Boot.Skills)
+	localPrompt := buildLocalSystemPrompt(env)
 
 	a := agent.New(agent.Config{
 		Model:         opts.Boot.Model,
 		MaxIterations: defaultMaxIterations,
-		SystemPrompts: []string{opts.Boot.SystemPrompt, localPrompt},
+		SystemPrompts: []string{serverPrompt, localPrompt},
 	}, opts.Provider,
 		agent.WithBus(opts.Bus),
+		agent.WithContextManager(opts.ContextManager),
 		agent.WithMiddlewares(permMw),
 	)
 
 	registerTools(a, opts.Workspace, opts.Boot, opts.Logger, opts.Client, opts.ThreadMgr, opts.Boot.ThreadID)
 
 	return &Runner{
-		Client:    opts.Client,
-		Agent:     a,
-		Logger:    opts.Logger,
-		Workspace: opts.Workspace,
-		Config:    opts.Config,
-		ThreadID:  opts.Boot.ThreadID,
-		ThreadMgr: opts.ThreadMgr,
-		Boot:      opts.Boot,
+		Client:        opts.Client,
+		Agent:         a,
+		Logger:        opts.Logger,
+		Workspace:     opts.Workspace,
+		Config:        opts.Config,
+		ThreadID:      opts.Boot.ThreadID,
+		ThreadMgr:     opts.ThreadMgr,
+		Boot:          opts.Boot,
+		TaskScheduler: opts.TaskScheduler,
+	}
+}
+
+func buildPromptEnv(boot *bootstrap.Result, workspace string) PromptEnv {
+	return PromptEnv{
+		Date:         boot.Date,
+		Timezone:     boot.Timezone,
+		OS:           boot.OS,
+		Workspace:    workspace,
+		ThreadID:     boot.ThreadID,
+		AxonClawPath: boot.AxonClawPath,
+		SkillsRoot:   boot.SkillsRoot,
+		ConfigDir:    boot.ConfigDir,
+		AgentID:      boot.AgentID,
+		AgentName:    boot.AgentName,
 	}
 }
 
 func (r *Runner) Run(ctx context.Context) error {
 	ctx = axoncontext.WithThreadID(ctx, r.ThreadID)
-	ctx = agent.WithWorkspace(ctx, r.Workspace)
+	ctx = axoncontext.WithWorkspace(ctx, r.Workspace)
 
-	pollTicker := time.NewTicker(r.Config.PollInterval)
-	defer pollTicker.Stop()
+	msgCh := make(chan string, 64)
+
+	// Separate goroutine for polling messages so that new messages can still
+	// be received while the agent is processing (enabling steering).
+	go r.pollMessages(ctx, msgCh)
+
 	hbTicker := time.NewTicker(r.Config.HeartbeatInterval)
 	defer hbTicker.Stop()
 
@@ -114,7 +139,42 @@ func (r *Runner) Run(ctx context.Context) error {
 				continue
 			}
 
-		case <-pollTicker.C:
+		case text := <-msgCh:
+			if r.processing.Load() {
+				// Agent is busy — deliver as a steering message so the
+				// current tool-call loop can be interrupted.
+				r.Logger.Info("agent busy, delivering as steering", "text_len", len(text))
+				t := text
+				r.Agent.Steer(agent.Message{
+					Role:    agent.RoleUser,
+					Content: &agent.Content{Text: &t},
+				})
+			} else {
+				// Agent is idle — start a new processing run in background
+				// so the main loop remains responsive.
+				t := text
+
+				go func() {
+					if err := r.processMessage(ctx, t); err != nil {
+						r.Logger.Warn("agent process failed", "error", err)
+					}
+				}()
+			}
+		}
+	}
+}
+
+// pollMessages continuously pulls chat messages from the server and sends
+// their text to out. It runs until ctx is canceled.
+func (r *Runner) pollMessages(ctx context.Context, out chan<- string) {
+	ticker := time.NewTicker(r.Config.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			limit := 50
 			afterSeq := r.lastSequence
 			typeIn := []api.AgentMessageType{api.AgentMessageTypeChat}
@@ -145,12 +205,12 @@ func (r *Runner) Run(ctx context.Context) error {
 					continue
 				}
 
-				if err := r.processMessage(ctx, msg.Text); err != nil {
-					r.Logger.Warn("agent process failed", "error", err, "message_id", msg.Id, "sequence", msg.Sequence)
-					continue
+				select {
+				case out <- msg.Text:
+					ackedIDs = append(ackedIDs, msg.Id)
+				case <-ctx.Done():
+					return
 				}
-
-				ackedIDs = append(ackedIDs, msg.Id)
 			}
 
 			if len(ackedIDs) > 0 {
@@ -165,14 +225,22 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) processMessage(ctx context.Context, text string) error {
+	r.processMu.Lock()
+	defer r.processMu.Unlock()
+
+	r.processing.Store(true)
+	defer r.processing.Store(false)
+
 	traceID := uuid.New().String()
-	// 显式设置 ThreadID 和 TraceID，确保 provider 调用时能正确传递到 HTTP Header
 	ctx = axoncontext.WithThreadID(ctx, r.ThreadID)
 	ctx = axoncontext.WithTraceID(ctx, traceID)
 	return r.Agent.Process(ctx, agent.Content{Text: &text})
 }
 
 func (r *Runner) autoUpdateConfig(ctx context.Context) {
+	r.processMu.Lock()
+	defer r.processMu.Unlock()
+
 	newBoot, err := bootstrap.Do(ctx, r.Client, bootstrap.SystemPromptData{
 		Workspace:  r.Workspace,
 		SkillsRoot: r.Boot.SkillsRoot,
@@ -190,23 +258,29 @@ func (r *Runner) autoUpdateConfig(ctx context.Context) {
 	r.Boot.Tools = newBoot.Tools
 	r.Boot.Skills = newBoot.Skills
 	r.Boot.BuiltinTools = newBoot.BuiltinTools
+	r.Boot.AxonClawPath = newBoot.AxonClawPath
+	r.Boot.Date = newBoot.Date
+	r.Boot.Timezone = newBoot.Timezone
+	r.Boot.OS = newBoot.OS
 
-	localPrompt := buildLocalSystemPrompt(PromptEnv{
-		Date:         newBoot.Date,
-		Timezone:     newBoot.Timezone,
-		OS:           newBoot.OS,
-		Workspace:    r.Workspace,
-		ThreadID:     r.ThreadID,
-		AxonClawPath: newBoot.AxonClawPath,
-		SkillsRoot:   r.Boot.SkillsRoot,
-		ConfigDir:    r.Boot.ConfigDir,
-	})
+	env := buildPromptEnv(newBoot, r.Workspace)
+	serverPrompt := buildServerSystemPrompt(newBoot.SystemPrompt, env)
+	serverPrompt = appendSkillsToPrompt(serverPrompt, newBoot.Skills)
+	localPrompt := buildLocalSystemPrompt(env)
 
 	r.Agent.UpdateConfig(func(cfg agent.Config) agent.Config {
 		cfg.Model = newBoot.Model
-		cfg.SystemPrompts = []string{newBoot.SystemPrompt, localPrompt}
+		cfg.SystemPrompts = []string{serverPrompt, localPrompt}
 		return cfg
 	})
 
 	r.Logger.Info("auto-update config completed", "agent_name", newBoot.AgentName, "model", newBoot.Model)
+}
+
+func (r *Runner) ProcessScheduledMessage(ctx context.Context, text string) error {
+	return r.processMessage(ctx, text)
+}
+
+func (r *Runner) SetTaskScheduler(s *task.Scheduler) {
+	r.TaskScheduler = s
 }

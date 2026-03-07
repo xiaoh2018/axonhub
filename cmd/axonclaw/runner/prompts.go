@@ -3,6 +3,8 @@ package runner
 import (
 	"strings"
 	"text/template"
+
+	"github.com/looplj/axonhub/axon/api"
 )
 
 const systemPrompt = `
@@ -43,6 +45,22 @@ Example workflow:
 
 Do NOT just output text - always use SendMessage to respond.
 
+## Handling New Topics
+
+When you detect the user is asking a **NEW question** (different from the current task):
+
+1. **Acknowledge first** — Use SendMessage to briefly confirm receipt, letting the user know you're working on it
+2. **Shift focus** — Redirect attention to the new topic and reduce weight on previous context
+   - Avoid confusion with old context
+   - Maintain clear conversation flow
+   - Keep responses relevant to the current question
+
+## Stopping & Pausing
+
+When the user says **"stop"**, **"停"**, **"暂停"**, **"立刻停"**, **"别做了"**, or any similar phrase meaning to halt:
+1. **Your ONLY action**: call SendMessage with target="user" to say "已暂停" (or "Paused" in English).
+2. **After that, do NOTHING** — no more tool calls, no summaries, no suggestions. End your turn immediately.
+
 ## Language
 
 Reply in the same language the user writes in — if they write English, reply in English; if Chinese, reply in Chinese.
@@ -72,6 +90,21 @@ Example workflow:
 1. Run: ` + "`{{.AxonClawPath}} discover`" + `
 2. Pick the appropriate agent based on name/description
 3. Call SendMessage with target="peer", targetAgentID, and targetInstanceID
+
+## Scheduled Tasks
+
+You can schedule tasks to send messages to yourself (the agent) at specific times:
+
+1. Run ` + "`{{.AxonClawPath}} tasks`" + ` commands to manage scheduled tasks
+2. Use ` + "`{{.AxonClawPath}} tasks add`" + ` to create a new task with a trigger and action
+3. The action type ` + "`send_agent_message`" + ` sends a message to the agent when triggered
+
+Example - Schedule a daily reminder:
+` + "```bash" + `
+{{.AxonClawPath}} tasks add --id daily-reminder --name "Daily Reminder" --trigger-type cron --cron "0 9 * * *" --action '{"type":"send_agent_message","message":"Check your daily tasks!"}'
+` + "```" + `
+
+Available trigger types: cron, interval, at
 
 ## AxonClaw Command Execution
 
@@ -103,6 +136,8 @@ type PromptEnv struct {
 	AxonClawPath string
 	SkillsRoot   string
 	ConfigDir    string
+	AgentID      string
+	AgentName    string
 }
 
 func buildLocalSystemPrompt(env PromptEnv) string {
@@ -119,4 +154,45 @@ func buildLocalSystemPrompt(env PromptEnv) string {
 	}
 
 	return result.String()
+}
+
+func buildServerSystemPrompt(prpmpt string, env PromptEnv) string {
+	if prpmpt == "" {
+		return ""
+	}
+
+	tmpl, err := template.New("server").Parse(prpmpt)
+	if err != nil {
+		return prpmpt
+	}
+
+	var result strings.Builder
+	if err := tmpl.Execute(&result, env); err != nil {
+		return prpmpt
+	}
+
+	return result.String()
+}
+
+func appendSkillsToPrompt(basePrompt string, skills []*api.AgentBootstrapAgentBootstrapSkillsAgentSkillDefinition) string {
+	if len(skills) == 0 {
+		return basePrompt
+	}
+
+	var sb strings.Builder
+	sb.WriteString(basePrompt)
+
+	for _, sk := range skills {
+		if sk.Name == "" || sk.Content == nil || strings.TrimSpace(*sk.Content) == "" {
+			continue
+		}
+
+		sb.WriteString("\n\n---\n\n")
+		sb.WriteString("## Skill: ")
+		sb.WriteString(sk.Name)
+		sb.WriteString("\n\n")
+		sb.WriteString(*sk.Content)
+	}
+
+	return sb.String()
 }
